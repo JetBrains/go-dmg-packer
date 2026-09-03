@@ -1,0 +1,6 @@
+# Build output.
+/dmg-packer
+/dmg-packer.exe
+
+# Local scratch.
+*.dmg
