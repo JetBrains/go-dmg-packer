@@ -1,22 +1,24 @@
 // Package dsstore composes the Finder `.DS_Store` that styles the installer
 // window of a disk image.
 //
-// The format itself is handled by `github.com/leaanthony/dmg/dsstore`. This
-// package only holds the layout: the window rectangle, the icon view
-// options, and where the two icons sit. Finder keys an icon's position on
-// the item's file name, so the layout cannot be bundle-name-agnostic on its
-// own and [Encode] takes the name.
+// The package holds both the layout — the window rectangle, the icon view
+// options, and where the two icons sit — and the encoder for the format
+// itself, which is a buddy-allocated block store holding a B-tree of
+// records. See `bud1.go` for the container and `record.go` for the records.
+// Only the records this layout needs are implemented.
+//
+// Finder keys an icon's position on the item's file name, so the layout
+// cannot be bundle-name-agnostic on its own and [Encode] takes the name.
 //
 // "Write-once" like the rest of this tool: [Encode] composes one complete
 // file. There is no support for reading or editing an existing `.DS_Store`.
 package dsstore
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 
-	upstream "github.com/leaanthony/dmg/dsstore"
+	"howett.net/plist"
 )
 
 // The drag-to-install pair, in points from the window's top-left corner.
@@ -79,44 +81,75 @@ func Encode(appEntry string) ([]byte, error) {
 		return nil, fmt.Errorf("dsstore: %q is not an `.app` bundle name", appEntry)
 	}
 
-	s := upstream.New()
-	// Write the legacy `fwi0` record and no `bwsp` record. Finder prefers `bwsp`, the modern window plist, whenever
-	// it is present. `bwsp` holds the window frame in Cocoa coordinates, which start at the bottom left of the
-	// screen, and the frame includes the title bar. A rectangle baked in at build time therefore puts the window at
-	// a height that depends on the screen, and it leaves the icon area 50 points too short. The two icons then touch
-	// the bottom edge. `fwi0` holds the content rectangle from the top left of the screen, so it gives the same
-	// window on every screen. It is also what `makedmg.py` writes, the macOS-host path this tool replaces.
-	//
-	// Do not add `upstream.Store.SetWindowSettings` back. That method writes `bwsp` only.
-	s.AddRecord(upstream.NewFwi0Record(windowTop, windowLeft, windowBottom, windowRight, upstream.FCC("icnv")))
-	s.AddRecord(upstream.NewFwswRecord(sidebarWidth))
-	s.AddRecord(upstream.NewFwvhRecord(windowBottom - windowTop))
-	s.SetViewStyle(upstream.FCC("icnv"))
-	s.SetIconViewOptions(upstream.IconViewOptions{
-		IconSize:      iconSize,
-		TextSize:      textSize,
-		GridSpace:     gridSpacing,
-		LabelOnBottom: true,
-		// The window shows one bundle and one alias, so an icon preview is the app icon and item info is noise.
-		ShowIconPreview: true,
-		ShowItemInfo:    false,
-		// A plain white ground. `/.background/` is staged but empty, so a picture record would point at nothing.
-		BackgroundType:  upstream.BackgroundColor,
-		BackgroundRed:   1,
-		BackgroundGreen: 1,
-		BackgroundBlue:  1,
-	})
+	iconView, err := iconViewProperties()
+	if err != nil {
+		return nil, err
+	}
 
-	s.SetIconPosition(appEntry, AppIconX, AppIconY)
-	s.SetIconPosition(AliasName, AliasIconX, AliasIconY)
+	records := []record{
+		// Write the legacy `fwi0` record and no `bwsp` record. Finder prefers `bwsp`, the modern window plist,
+		// whenever it is present. `bwsp` holds the window frame in Cocoa coordinates, which start at the bottom left
+		// of the screen, and the frame includes the title bar. A rectangle baked in at build time therefore puts the
+		// window at a height that depends on the screen, and it leaves the icon area 50 points too short. The two
+		// icons then touch the bottom edge. `fwi0` holds the content rectangle from the top left of the screen, so it
+		// gives the same window on every screen. It is also what `makedmg.py` writes, the macOS-host path this tool
+		// replaces.
+		//
+		// Do not add a `bwsp` record.
+		fwi0Record(windowTop, windowLeft, windowBottom, windowRight, viewIcon),
+		{name: ".", code: codeFwsw, value: longValue(sidebarWidth)},
+		{name: ".", code: codeFwvh, value: shortValue(windowBottom - windowTop)},
+		{name: ".", code: codeVstl, value: typeValue(viewIcon)},
+		{name: ".", code: codeIcvp, value: blobValue(iconView)},
+		// Modern Finder wants the view named again as a type code beside the plist.
+		{name: ".", code: codeIcvl, value: typeValue(viewIcon)},
+		// The format version. Finder treats a store without it as unreadable.
+		{name: ".", code: codeVSrn, value: longValue(1)},
+
+		ilocRecord(appEntry, AppIconX, AppIconY),
+		ilocRecord(AliasName, AliasIconX, AliasIconY),
+	}
 	for i, name := range hiddenNames {
-		s.SetIconPosition(name, hiddenIconX+i*hiddenIconStep, hiddenIconY)
+		records = append(records, ilocRecord(name, hiddenIconX+i*hiddenIconStep, hiddenIconY))
 	}
-	s.EnsureDefaults()
 
-	var buf bytes.Buffer
-	if err := s.WriteTo(&buf); err != nil {
-		return nil, fmt.Errorf("dsstore: encode: %w", err)
+	return encodeContainer(records)
+}
+
+// iconViewProperties returns the binary plist that goes in the `icvp` record.
+//
+// The keys are the ones Finder writes itself, and it is unforgiving about
+// them: an unexpected value makes it discard the whole plist and fall back to
+// its own defaults, which looks like the record never arrived. In particular a
+// `gridSpacing` above 100 loses every icon view setting, and a
+// `backgroundType` of 0 does the same, so a white ground is spelled out as a
+// colour instead.
+//
+// The distinction between an integer and a real matters here too, because it
+// survives into the encoding, so the numbers below are typed deliberately.
+func iconViewProperties() ([]byte, error) {
+	data, err := plist.Marshal(map[string]any{
+		"viewOptionsVersion": 1,
+		"iconSize":           float64(iconSize),
+		"textSize":           float64(textSize),
+		"gridSpacing":        float64(gridSpacing),
+		"gridOffsetX":        float64(0),
+		"gridOffsetY":        float64(0),
+		"arrangeBy":          "none",
+		"scrollPositionX":    float64(0),
+		"scrollPositionY":    float64(0),
+		"labelOnBottom":      true,
+		// The window shows one bundle and one alias, so an icon preview is the app icon and item info is noise.
+		"showIconPreview": true,
+		"showItemInfo":    false,
+		// A plain white ground. `/.background/` is staged but empty, so a picture record would point at nothing.
+		"backgroundType":       1,
+		"backgroundColorRed":   float64(1),
+		"backgroundColorGreen": float64(1),
+		"backgroundColorBlue":  float64(1),
+	}, plist.BinaryFormat)
+	if err != nil {
+		return nil, fmt.Errorf("dsstore: encode the icon view properties: %w", err)
 	}
-	return buf.Bytes(), nil
+	return data, nil
 }
