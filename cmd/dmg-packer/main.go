@@ -1,22 +1,20 @@
-// Command dmg-packer builds a macOS disk image out of a finished folder.
+// Command dmg-packer builds a macOS disk image out of an application bundle.
 // It is a CLI over [dmg.DMG.Create] in `github.com/jetbrains/go-dmg-writer`.
 //
 // Usage:
 //
-//	dmg-packer -src ./build/MyApp -out MyApp.dmg -mode udzo -name MyApp
+//	dmg-packer -app ./build/MyApp.app -out MyApp.dmg -mode udzo -name MyApp
 //
-// The tool takes a finished folder: [dmg.DMG.Create] copies a source tree
-// verbatim, so a `/Applications` symlink or a `/.background/` folder is
-// staged by the caller. It also formats the volume itself, so there is no
-// seed image to supply.
-//
-// With -layout the tool adds the Finder `.DS_Store` that turns the window
-// into a drag-to-install pair. See [dsstore].
+// The tool takes the bundle alone and stages the volume root itself, because
+// [dmg.DMG.Create] copies a source tree verbatim: see [stage]. It also
+// formats the volume itself, so there is no seed image to supply.
 package main
 
 import (
 	"flag"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -29,15 +27,15 @@ import (
 
 func main() {
 	var (
-		srcFlag    = flag.String("src", "", "source folder (required)")
-		outFlag    = flag.String("out", "", "output .dmg path (required)")
-		modeFlag   = flag.String("mode", "udzo", "output mode: udro | udzo")
-		nameFlag   = flag.String("name", "disk image", "volume name as it appears in Finder")
-		timeFlag   = flag.Int64("time", 0, "Unix timestamp baked into the volume (0 = now)")
-		layoutFlag = flag.Bool("layout", false, "add the Finder `.DS_Store` that lays out the installer window")
+		appFlag  = flag.String("app", "", "the `.app` bundle to install (required)")
+		outFlag  = flag.String("out", "", "output .dmg path (required)")
+		bgFlag   = flag.String("background", "", "picture to stage in `/.background/`")
+		modeFlag = flag.String("mode", "udzo", "output mode: udro | udzo")
+		nameFlag = flag.String("name", "disk image", "volume name as it appears in Finder")
+		timeFlag = flag.Int64("time", 0, "Unix timestamp baked into the volume (0 = now)")
 	)
 	flag.Parse()
-	if *srcFlag == "" || *outFlag == "" {
+	if *appFlag == "" || *outFlag == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -59,11 +57,11 @@ func main() {
 		when = time.Unix(*timeFlag, 0).UTC()
 	}
 
-	if *layoutFlag {
-		if err := writeDSStore(*srcFlag); err != nil {
-			log.Fatalf("dmg-packer: %v", err)
-		}
+	root, err := stage(*appFlag, *bgFlag)
+	if err != nil {
+		log.Fatalf("dmg-packer: %v", err)
 	}
+	defer os.RemoveAll(root)
 
 	d := &dmg.DMG{
 		VolumeName: *nameFlag,
@@ -73,32 +71,104 @@ func main() {
 		OwnerID: dmg.OwnerIDUnset,
 		GroupID: dmg.OwnerIDUnset,
 	}
-	if err := d.Create(*srcFlag, *outFlag, mode); err != nil {
+	if err := d.Create(root, *outFlag, mode); err != nil {
 		log.Fatalf("dmg create: %v", err)
 	}
 	st, _ := os.Stat(*outFlag)
 	fmt.Fprintf(os.Stderr, "wrote %s (%d bytes)\n", *outFlag, st.Size())
 }
 
-// writeDSStore puts the Finder layout in the volume root, keyed on the bundle it finds there. The file has to exist
-// before [dmg.DMG.Create] copies the tree, because the writer takes the source verbatim.
-func writeDSStore(src string) error {
-	entries, err := os.ReadDir(src)
+// stage builds the volume root in a temporary folder and returns it: the
+// bundle, the `/Applications` symlink it is dragged onto, the `/.background/`
+// folder, and the Finder layout keyed on the bundle's name. The caller
+// removes the folder. bgPath may be empty, which stages the folder empty.
+func stage(appPath, bgPath string) (string, error) {
+	appEntry := filepath.Base(filepath.Clean(appPath))
+	store, err := dsstore.Encode(appEntry)
 	if err != nil {
-		return fmt.Errorf("read the source folder: %w", err)
+		return "", err
 	}
-	var bundles []string
-	for _, e := range entries {
-		if e.IsDir() && strings.HasSuffix(e.Name(), ".app") {
-			bundles = append(bundles, e.Name())
+	root, err := os.MkdirTemp("", "dmg-packer-")
+	if err != nil {
+		return "", err
+	}
+	background := filepath.Join(root, ".background")
+	err = func() error {
+		if err := copyTree(appPath, filepath.Join(root, appEntry)); err != nil {
+			return err
 		}
+		// An absolute target, so it resolves to the host's `/Applications` rather than into the mounted volume.
+		if err := os.Symlink("/Applications", filepath.Join(root, dsstore.AliasName)); err != nil {
+			return err
+		}
+		if err := os.Mkdir(background, 0o755); err != nil {
+			return err
+		}
+		if bgPath != "" {
+			if err := copyFile(bgPath, filepath.Join(background, filepath.Base(bgPath)), 0o644); err != nil {
+				return err
+			}
+		}
+		return os.WriteFile(filepath.Join(root, ".DS_Store"), store, 0o644)
+	}()
+	if err != nil {
+		os.RemoveAll(root)
+		return "", fmt.Errorf("stage the volume root: %w", err)
 	}
-	if len(bundles) != 1 {
-		return fmt.Errorf("the source folder %s holds %d `.app` bundles, want exactly 1: %v", src, len(bundles), bundles)
-	}
-	b, err := dsstore.Encode(bundles[0])
+	return root, nil
+}
+
+// copyTree copies the tree rooted at src to dst. A bundle's symlinks are
+// copied as symlinks rather than followed, because the ones inside a
+// framework are what make it loadable. Modification times are not carried
+// over: the writer stamps the catalog with one time of its own.
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if entry.Type()&fs.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case entry.IsDir():
+			// The owner bits are forced on so the walk can write into a folder even if the source is read-only.
+			return os.MkdirAll(target, info.Mode().Perm()|0o700)
+		case entry.Type().IsRegular():
+			return copyFile(path, target, info.Mode().Perm())
+		default:
+			return fmt.Errorf("%s is a %s, which cannot go in a disk image", path, entry.Type())
+		}
+	})
+}
+
+// copyFile copies one file, creating the destination with perm.
+func copyFile(src, dst string, perm fs.FileMode) error {
+	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(src, ".DS_Store"), b, 0o644)
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
