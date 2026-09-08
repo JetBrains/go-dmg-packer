@@ -4,3 +4,6 @@
 
 # Local scratch.
 *.dmg
+
+# Instrument folders
+.idea
