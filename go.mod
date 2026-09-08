@@ -3,7 +3,7 @@ module github.com/jetbrains/go-dmg-packer
 go 1.24.0
 
 require (
-	github.com/jetbrains/go-dmg-writer v0.0.0-20260527210146-38e775a8242e
+	github.com/jetbrains/go-dmg-writer v0.0.0-20260907121604-149c5f3195fe
 	howett.net/plist v1.0.1
 )
 

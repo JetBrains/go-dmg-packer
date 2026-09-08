@@ -33,6 +33,7 @@ func main() {
 		modeFlag = flag.String("mode", "udzo", "output mode: udro | udzo")
 		nameFlag = flag.String("name", "disk image", "volume name as it appears in Finder")
 		timeFlag = flag.Int64("time", 0, "Unix timestamp baked into the volume (0 = now)")
+		partFlag = flag.Bool("partition", true, "frame the volume in a GUID partition table")
 	)
 	flag.Parse()
 	if *appFlag == "" || *outFlag == "" {
@@ -70,6 +71,9 @@ func main() {
 		// permissions on any host. The struct's zero value is the literal root UID, which is NOT what we want.
 		OwnerID: dmg.OwnerIDUnset,
 		GroupID: dmg.OwnerIDUnset,
+		// A whole-disk layout, as `hdiutil create -layout GPTSPUD` writes it. macOS mounts a map-less image
+		// too, but a tool that parses the image without mounting it has nowhere to start without the map.
+		PartitionMap: *partFlag,
 	}
 	if err := d.Create(root, *outFlag, mode); err != nil {
 		log.Fatalf("dmg create: %v", err)
