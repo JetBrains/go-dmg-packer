@@ -5,6 +5,9 @@
 //
 //	dmg-packer -app ./build/MyApp.app -out MyApp.dmg -mode udzo -name MyApp
 //
+// The `-app` argument is the bundle folder, or a zip, tar or gzipped tar
+// archive holding one: see [resolveApp].
+//
 // The tool takes the bundle alone and stages the volume root itself, because
 // [dmg.DMG.Create] copies a source tree verbatim: see [stage]. It also
 // formats the volume itself, so there is no seed image to supply.
@@ -27,7 +30,7 @@ import (
 
 func main() {
 	var (
-		appFlag  = flag.String("app", "", "the `.app` bundle to install (required)")
+		appFlag  = flag.String("app", "", "the `.app` bundle to install, or a zip/tar archive holding one (required)")
 		outFlag  = flag.String("out", "", "output .dmg path (required)")
 		bgFlag   = flag.String("background", "", "picture to stage in `/.background/`")
 		modeFlag = flag.String("mode", "udzo", "output mode: udro | udzo")
@@ -58,7 +61,13 @@ func main() {
 		when = time.Unix(*timeFlag, 0).UTC()
 	}
 
-	root, err := stage(*appFlag, *bgFlag)
+	app, unpacked, err := resolveApp(*appFlag)
+	defer unpacked()
+	if err != nil {
+		log.Fatalf("dmg-packer: %v", err)
+	}
+
+	root, err := stage(app, *bgFlag)
 	if err != nil {
 		log.Fatalf("dmg-packer: %v", err)
 	}
@@ -72,7 +81,7 @@ func main() {
 		OwnerID: dmg.OwnerIDUnset,
 		GroupID: dmg.OwnerIDUnset,
 		// A whole-disk layout, as `hdiutil create -layout GPTSPUD` writes it. macOS mounts a map-less image
-		// too, but a tool that parses the image without mounting it has nowhere to start without the map.
+		// too; a tool that parses one without mounting it cannot.
 		PartitionMap: *partFlag,
 	}
 	if err := d.Create(root, *outFlag, mode); err != nil {

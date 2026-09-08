@@ -1,22 +1,21 @@
 # go-dmg-packer
 
-A cross-platform CLI that packs a finished folder into a macOS `.dmg`, with an
-optional Finder layout that turns the mounted window into a drag-to-install
-pair.
+A cross-platform CLI that packs a macOS `.app` bundle into a `.dmg`, laid out
+as the usual drag-to-install window. No cgo and no `hdiutil`: it builds and
+runs on macOS, Linux and Windows.
 
-The disk-image format itself comes from
+The disk-image format comes from
 [`github.com/jetbrains/go-dmg-writer`](https://github.com/JetBrains/go-dmg-writer);
-this repository holds only the CLI and the `.DS_Store` layout.
+this repository holds the CLI and the Finder layout.
 
 ```console
-$ dmg-packer -src ./build/MyApp -out MyApp.dmg -name MyApp -layout
+$ dmg-packer -app ./build/MyApp.app -out MyApp.dmg -name MyApp
 wrote MyApp.dmg (72301184 bytes)
 ```
 
 ## Install
 
-`go-dmg-writer` is a private module, so point the toolchain at it before
-building:
+`go-dmg-writer` is a private module, so point the toolchain at it first:
 
 ```console
 $ export GOPRIVATE='github.com/jetbrains/*'
@@ -29,63 +28,86 @@ Or from a checkout:
 $ CGO_ENABLED=0 go build -o dmg-packer ./cmd/dmg-packer
 ```
 
-No cgo, no `hdiutil`, no external tools: the binary builds and runs on macOS,
-Linux, and Windows. Windows is a poor host in practice, because NTFS loses the
-POSIX modes and symlinks that a signed bundle needs.
-
 ## Flags
 
-| Flag      | Default        | Meaning                                                     |
-| --------- | -------------- | ----------------------------------------------------------- |
-| `-src`    | —              | Source folder. Required.                                    |
-| `-out`    | —              | Output `.dmg` path. Required.                               |
-| `-mode`   | `udzo`         | `udro` (uncompressed UDIF) or `udzo` (per-chunk zlib).      |
-| `-name`   | `disk image`   | Volume name as it appears in Finder.                        |
-| `-time`   | `0`            | Unix timestamp baked into the volume. `0` means now.        |
-| `-layout` | `false`        | Write the Finder `.DS_Store` into `-src` before packing.    |
+| Flag          | Default      | Meaning                                                        |
+| ------------- | ------------ | -------------------------------------------------------------- |
+| `-app`        | —            | The `.app` bundle, or a zip/tar archive holding one. Required. |
+| `-out`        | —            | Output `.dmg` path. Required.                                  |
+| `-background` | —            | Picture to stage in `/.background/`.                           |
+| `-mode`       | `udzo`       | `udro` (uncompressed UDIF) or `udzo` (per-chunk zlib).         |
+| `-name`       | `disk image` | Volume name as it appears in Finder.                           |
+| `-time`       | `0`          | Unix timestamp baked into the volume. `0` means now.           |
+| `-partition`  | `true`       | Frame the volume in a GUID partition table.                    |
 
-A missing `-src` or `-out` prints the usage and exits 2. Any other failure logs
-and exits 1. On success the tool prints `wrote <path> (<n> bytes)` to stderr.
+A missing `-app` or `-out` prints the usage and exits 2; any other failure
+logs and exits 1. On success the tool prints `wrote <path> (<n> bytes)` to
+stderr.
 
-## Staging the source folder
+## The bundle
 
-The tool takes a *finished* folder. The writer copies the source tree verbatim
-and formats the volume itself, so there is no seed image to supply — but it
-also means the caller stages everything the mounted volume should show:
+`-app` takes the bundle folder, or a `.zip`, `.tar`, `.tar.gz` or `.tgz`
+holding it — the extension picks the format:
 
-```
-MyApp/                  <- pass this as -src
-├── MyApp.app/          <- the signed bundle
-├── Applications        <- symlink to /Applications
-└── .background/        <- empty, or holding a window background image
+```console
+$ dmg-packer -app ./out/MyApp-1.2.3-arm64.zip -out MyApp.dmg -name MyApp
 ```
 
-Then `-layout` adds the `.DS_Store`. It requires exactly one `*.app` in the
-volume root, because Finder keys each icon's position on the item's file name.
+The archive has to hold the `.app` folder at its top level, which is what a
+build produces; loose files beside it are ignored. Anything else — several
+folders, or the bundle's bare contents from `ditto -c -k` without
+`--keepParent` — is refused rather than guessed at.
+
+Two things to know when packing from an archive:
+
+- **A zip from a Windows tool carries no POSIX modes.** Files under
+  `Contents/MacOS` are always made executable, since the bundle cannot run
+  otherwise. If it needs the execute bit anywhere else, pass a tar or a
+  folder. Folder modes are not carried over either: every folder is `0755`.
+- **AppleDouble sidecars are dropped**, both `__MACOSX/` and `._name`. The
+  xattrs and resource forks they carry are not written to the volume either
+  way.
+- **The volume name comes from `-name`**, not from the bundle or the archive.
+
+## The volume
+
+The bundle is all you pass; the rest of the volume root is staged for you.
+
+```
+/
+├── MyApp.app/          <- from -app
+├── Applications        <- symlink to drag onto
+├── .background/        <- the -background picture, if any
+└── .DS_Store           <- the Finder layout
+```
 
 ## Reproducible output
 
-Pass a fixed `-time` and the output is byte-stable: the writer stamps every
-catalog record with it, so source mtimes need no normalizing.
+Pass a fixed `-time` and the output is byte-stable, whatever the source
+mtimes:
 
 ```console
-$ dmg-packer -src ./vol -out a.dmg -time "$SOURCE_DATE_EPOCH"
-$ dmg-packer -src ./vol -out b.dmg -time "$SOURCE_DATE_EPOCH"
+$ dmg-packer -app ./MyApp.app -out a.dmg -time "$SOURCE_DATE_EPOCH"
+$ dmg-packer -app ./MyApp.app -out b.dmg -time "$SOURCE_DATE_EPOCH"
 $ cmp a.dmg b.dmg   # identical
 ```
 
-## Limitations
+With `-partition`, the partition GUIDs are derived from the volume name,
+`-time` and size, so two images built from the same three carry the same
+GUIDs.
 
-Inherited from the writer:
+## Limitations
 
 - The volume is HFSX (case-sensitive), not classic HFS+.
 - Only `udro` and `udzo`. No `ulfo`/LZFSE, no `udbz`/bzip2.
-- No GUID partition map, so the image mounts but non-mounting parsers may
-  reject it.
+- Archive input is `.zip`, `.tar`, `.tar.gz` and `.tgz` only — no bzip2, xz
+  or zstd, and the name has to match the format.
 - No software licence agreement (SLA) resource, no journaling, no resource
   forks, no encryption.
 - Hard links are duplicated, and symlink targets are stored verbatim.
 - Write-only: it cannot read an existing `.dmg`.
+- Windows is a poor build host: NTFS loses the POSIX modes and symlinks a
+  signed bundle needs.
 
 Codesigning and notarization are the caller's job, after the image is written.
 
@@ -95,9 +117,6 @@ Codesigning and notarization are the caller's job, after the image is written.
 $ go test ./...
 $ go vet ./...
 ```
-
-`internal/dsstore` carries the layout tests, which decode the `Bud1` container
-that `Encode` produces and assert the icon positions and window records.
 
 ## Licence
 
