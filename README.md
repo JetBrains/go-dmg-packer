@@ -1,5 +1,7 @@
 # go-dmg-packer
 
+![Internal](https://jb.gg/badges/internal-plastic.svg)
+
 A cross-platform CLI that packs a macOS `.app` bundle into a `.dmg`, laid out
 as the usual drag-to-install window. No cgo and no `hdiutil`: it builds and
 runs on macOS, Linux and Windows.
