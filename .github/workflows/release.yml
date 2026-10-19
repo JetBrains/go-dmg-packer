@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 1.2.3 or v1.2.3 (tag will be v-prefixed)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: ensure running from main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases can only be published from main (got ${GITHUB_REF})."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - name: validate version
+        id: version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          tag="v${VERSION#v}"
+          if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version '${VERSION}' is not a valid semantic version (expected X.Y.Z or X.Y.Z-suffix)."
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null; then
+            echo "::error::Tag ${tag} already exists."
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -ldflags '-s -w' \
+            -o "dist/dmg-packer-${GOOS}-${GOARCH}${{ matrix.ext }}" \
+            ./cmd/dmg-packer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg-packer-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: release ${{ needs.prepare.outputs.tag }}
+    needs: [prepare, test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dmg-packer-*
+          path: dist
+          merge-multiple: true
+
+      - name: generate checksums
+        working-directory: dist
+        run: |
+          sha256sum dmg-packer-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: push tag
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/${TAG}"
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes \
+            "${prerelease[@]}" \
+            dist/*
